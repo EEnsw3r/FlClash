@@ -8,83 +8,124 @@ import 'system.dart';
 import 'windows.dart';
 
 class AutoLaunch {
-  static AutoLaunch? _instance;
+  static final AutoLaunch _instance = AutoLaunch._internal();
+
+  factory AutoLaunch() => _instance;
 
   AutoLaunch._internal() {
-    launchAtStartup.setup(
-      appName: appName,
-      appPath: Platform.resolvedExecutable,
-    );
+    if (system.isDesktop) {
+      launchAtStartup.setup(
+        appName: appName,
+        appPath: Platform.resolvedExecutable,
+      );
+    }
   }
 
-  factory AutoLaunch() {
-    _instance ??= AutoLaunch._internal();
-    return _instance!;
-  }
-
-  Future<bool> get isEnable async {
+  Future<bool> get isEnabled async {
+    if (!system.isDesktop) return false;
     return await launchAtStartup.isEnabled();
   }
 
-  Future<bool> get windowsIsEnable async {
-    final res = await Process.run(
-      'schtasks',
-      ['/Query', '/TN', appName, '/V', "/FO", "LIST"],
-      runInShell: true,
-    );
-    return res.stdout.toString().contains(Platform.resolvedExecutable);
+  Future<bool> get windowsIsEnabled async {
+    if (!Platform.isWindows) return false;
+    try {
+      final result = await Process.run(
+        'schtasks',
+        ['/Query', '/TN', appName, '/V', '/FO', 'LIST'],
+        runInShell: true,
+      );
+
+      if (result.exitCode != 0) {
+        // Task does not exist or another error occurred
+        return false;
+      }
+
+      return result.stdout.toString().contains(appName);
+    } catch (e) {
+      // Log the error if necessary
+      return false;
+    }
   }
 
   Future<bool> enable() async {
+    if (!system.isDesktop) return false;
     if (Platform.isWindows) {
-      await windowsDisable();
+      final disabled = await windowsDisable();
+      if (!disabled) {
+        // Handle disable failure if necessary
+      }
+      return await launchAtStartup.enable();
+    } else {
+      return await launchAtStartup.enable();
     }
-    return await launchAtStartup.enable();
   }
 
-  windowsDisable() async {
-    final res = await Process.run(
-      'schtasks',
-      [
-        '/Delete',
-        '/TN',
-        appName,
-        '/F',
-      ],
-      runInShell: true,
-    );
-    return res.exitCode == 0;
+  Future<bool> windowsDisable() async {
+    if (!Platform.isWindows) return false;
+    try {
+      final result = await Process.run(
+        'schtasks',
+        ['/Delete', '/TN', appName, '/F'],
+        runInShell: true,
+      );
+      return result.exitCode == 0;
+    } catch (e) {
+      // Log the error if necessary
+      return false;
+    }
   }
 
   Future<bool> windowsEnable() async {
-    await disable();
-    return await windows?.registerTask(appName) ?? false;
+    if (!Platform.isWindows) return false;
+    final win = Windows();
+    try {
+      final success = await win.registerTask(appName);
+      if (!success) {
+        // Fallback to launchAtStartup if Windows task registration fails
+        return await enable();
+      }
+      return success;
+    } catch (e) {
+      // Log the error if necessary
+      return false;
+    }
   }
 
   Future<bool> disable() async {
-    return await launchAtStartup.disable();
+    if (!system.isDesktop) return false;
+    if (Platform.isWindows) {
+      return await windowsDisable();
+    } else {
+      return await launchAtStartup.disable();
+    }
   }
 
-  updateStatus(AutoLaunchState state) async {
-    final isAdminAutoLaunch = state.isAdminAutoLaunch;
+  Future<void> updateStatus(AutoLaunchState state) async {
+    if (!system.isDesktop) return;
+
     final isAutoLaunch = state.isAutoLaunch;
-    if (Platform.isWindows && isAdminAutoLaunch) {
-      if (await windowsIsEnable == isAutoLaunch) return;
+    if (Platform.isWindows && state.isAdminAutoLaunch) {
+      final currentStatus = await windowsIsEnabled;
+      if (currentStatus == isAutoLaunch) return;
+
       if (isAutoLaunch) {
-        final isEnable = await windowsEnable();
-        if (!isEnable) {
-          enable();
+        final enabled = await windowsEnable();
+        if (!enabled) {
+          // Optionally handle failure
         }
       } else {
-        windowsDisable();
+        await windowsDisable();
       }
       return;
     }
-    if (await isEnable == isAutoLaunch) return;
-    if (isAutoLaunch == true) {
-      enable();
+
+    final currentStatus = await isEnabled;
+    if (currentStatus == isAutoLaunch) return;
+
+    if (isAutoLaunch) {
+      await enable();
     } else {
-      disable();
+      await disable();
     }
   }
 }
