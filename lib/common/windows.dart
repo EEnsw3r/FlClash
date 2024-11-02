@@ -1,81 +1,84 @@
+import 'dart:async';
 import 'dart:ffi';
 import 'dart:io';
 import 'package:ffi/ffi.dart';
 import 'package:fl_clash/common/common.dart';
-import 'package:path/path.dart';
+import 'package:path/path.dart' as p;
 
 class Windows {
-  static Windows? _instance;
-  late DynamicLibrary _shell32;
+  static final Windows _instance = Windows._internal();
+  late final DynamicLibrary _shell32;
+
+  factory Windows() => _instance;
 
   Windows._internal() {
-    _shell32 = DynamicLibrary.open('shell32.dll');
+    try {
+      _shell32 = DynamicLibrary.open('shell32.dll');
+    } catch (e) {
+      throw Exception('Failed to load shell32.dll: $e');
+    }
   }
 
-  factory Windows() {
-    _instance ??= Windows._internal();
-    return _instance!;
-  }
-
-  bool runas(String command, String arguments) {
+  /// Executes a command with elevated privileges using ShellExecuteW.
+  bool runAsAdmin(String command, String arguments) {
     final commandPtr = command.toNativeUtf16();
     final argumentsPtr = arguments.toNativeUtf16();
     final operationPtr = 'runas'.toNativeUtf16();
 
-    final shellExecute = _shell32.lookupFunction<
-        Int32 Function(
-            Pointer<Utf16> hwnd,
-            Pointer<Utf16> lpOperation,
-            Pointer<Utf16> lpFile,
-            Pointer<Utf16> lpParameters,
-            Pointer<Utf16> lpDirectory,
-            Int32 nShowCmd),
-        int Function(
-            Pointer<Utf16> hwnd,
-            Pointer<Utf16> lpOperation,
-            Pointer<Utf16> lpFile,
-            Pointer<Utf16> lpParameters,
-            Pointer<Utf16> lpDirectory,
-            int nShowCmd)>('ShellExecuteW');
+    try {
+      final ShellExecuteW = _shell32.lookupFunction<
+          IntPtr Function(Pointer<Utf16>, Pointer<Utf16>, Pointer<Utf16>,
+              Pointer<Utf16>, Pointer<Utf16>, Int32),
+          int Function(Pointer<Utf16>, Pointer<Utf16>, Pointer<Utf16>,
+              Pointer<Utf16>, Pointer<Utf16>, int)>('ShellExecuteW');
 
-    final result = shellExecute(
-      nullptr,
-      operationPtr,
-      commandPtr,
-      argumentsPtr,
-      nullptr,
-      1,
-    );
+      final result = ShellExecuteW(
+        nullptr,
+        operationPtr,
+        commandPtr,
+        argumentsPtr,
+        nullptr,
+        SW_SHOW,
+      );
 
-    calloc.free(commandPtr);
-    calloc.free(argumentsPtr);
-    calloc.free(operationPtr);
-
-    if (result <= 32) {
+      return result > 32;
+    } catch (e) {
+      // Log the error if necessary
       return false;
+    } finally {
+      calloc.free(commandPtr);
+      calloc.free(argumentsPtr);
+      calloc.free(operationPtr);
     }
-    return true;
   }
 
+  /// Registers a task in Task Scheduler to run the application at startup.
   Future<bool> registerTask(String appName) async {
+    final executablePath = Platform.resolvedExecutable;
     final taskXml = '''
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>YourName</Author>
+    <Description>Run $appName at user logon</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
   <Principals>
     <Principal id="Author">
       <LogonType>InteractiveToken</LogonType>
       <RunLevel>HighestAvailable</RunLevel>
     </Principal>
   </Principals>
-  <Triggers>
-    <LogonTrigger/>
-  </Triggers>
   <Settings>
-    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>false</AllowHardTerminate>
-    <StartWhenAvailable>false</StartWhenAvailable>
+    <StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
     <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
     <IdleSettings>
       <StopOnIdleEnd>false</StopOnIdleEnd>
@@ -86,32 +89,56 @@ class Windows {
     <Hidden>false</Hidden>
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT72H</ExecutionTimeLimit>
     <Priority>7</Priority>
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>"${Platform.resolvedExecutable}"</Command>
+      <Command>${_escapeXml(executablePath)}</Command>
     </Exec>
   </Actions>
 </Task>''';
-    final taskPath = join(await appPath.tempPath, "task.xml");
-    await File(taskPath).create(recursive: true);
-    await File(taskPath)
-        .writeAsBytes(taskXml.encodeUtf16LeWithBom, flush: true);
-    final commandLine = [
-      '/Create',
-      '/TN',
-      appName,
-      '/XML',
-      "%s",
-      '/F',
-    ].join(" ");
-    return runas(
-      'schtasks',
-      commandLine.replaceFirst("%s", taskPath),
-    );
+
+    try {
+      final tempDir = Directory.systemTemp;
+      final taskFile = File(p.join(tempDir.path, 'task.xml'));
+
+      await taskFile.writeAsBytes(taskXml.encode('utf-16le'), flush: true);
+
+      final result = await Process.run(
+        'schtasks',
+        [
+          '/Create',
+          '/TN',
+          appName,
+          '/XML',
+          taskFile.path,
+          '/F',
+        ],
+        runInShell: true,
+      );
+
+      if (result.exitCode != 0) {
+        // Log the stderr if necessary
+        return false;
+      }
+
+      return true;
+    } catch (e) {
+      // Log the error if necessary
+      return false;
+    }
   }
+
+  String _escapeXml(String input) {
+    return input
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&apos;');
+  }
+
+  static const int SW_SHOW = 5;
 }
 
 final windows = Platform.isWindows ? Windows() : null;
